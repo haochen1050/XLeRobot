@@ -21,6 +21,9 @@ code under `../src/` — nothing was moved or renamed.
   (`--robot.type=xlerobot_mecanum`).
 - `lerobot_teleoperator_xlerobot_vr/` — the VR teleoperator
   (`--teleop.type=xlerobot_vr`).
+- `xlerobot_table_alignment/` — AprilTag base alignment to a table for the
+  3-omniwheel base. Not a lerobot plugin: see
+  [its README](../examples/table_alignment/README.md).
 
 ## Install (editable, for development)
 
@@ -30,6 +33,7 @@ pip install -e software/plugins/lerobot_robot_xlerobot
 pip install -e software/plugins/lerobot_robot_xlerobot_2wheels
 pip install -e software/plugins/lerobot_robot_xlerobot_mecanum
 pip install -e software/plugins/lerobot_teleoperator_xlerobot_vr
+pip install -e software/plugins/xlerobot_table_alignment
 ```
 
 ## Verifying discovery

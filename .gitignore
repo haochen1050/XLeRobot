@@ -35,6 +35,9 @@ venv.bak/
 .conda_env/
 .python-version
 
+# Script outputs (calibration, logs)
+outputs/
+
 # Test and coverage outputs
 .tox/
 .nox/

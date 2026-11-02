@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "xlerobot_table_alignment"
+version = "0.1.0"
+description = "AprilTag base alignment to a table for the 3-omniwheel XLeRobot"
+requires-python = ">=3.10"
+dependencies = [
+    "lerobot[feetech]",
+    "numpy",
+    "opencv-python>=4.7",
+    "pyrealsense2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["xlerobot_table_alignment"]
