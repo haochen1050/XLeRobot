@@ -3,6 +3,8 @@
 Drives the base to a taught pose in front of a table using an AprilTag and the head RealSense, in short pulses that
 each end in a verified stop. Ported from AlohaMini. The code is in `software/src/table_alignment`.
 
+How it works, the code layout, host-PC notes and troubleshooting: [OVERVIEW.md](OVERVIEW.md).
+
 **Not yet run on an XLeRobot.** The steps below are also the bring-up: do them in order, and don't skip the sign check.
 
 Software stopping is not an emergency stop. Keep a hand on the base power whenever it is on.
