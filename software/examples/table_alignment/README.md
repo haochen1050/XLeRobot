@@ -56,6 +56,14 @@ pose. If you capture again, redo steps 3 and 5. `head_pose.py goto` slowly retur
 python table_perception.py realsense-intrinsics
 ```
 
+With an Orbbec camera (such as a Femto Bolt) instead, give the V4L2 device and its mode before the subcommand on
+every call, and read its factory calibration with `orbbec-intrinsics` (needs `pip install --no-deps pyorbbecsdk2`
+and the SDK's udev rules):
+
+```bash
+python table_perception.py --camera /dev/video8 --size 1280x720 --fourcc MJPG orbbec-intrinsics
+```
+
 Lay the tag flat on the floor where the head camera sees it, with its printed top pointing away from the robot.
 Measure from the base centre (the middle of the three omniwheels) to the tag centre:
 
@@ -63,7 +71,9 @@ Measure from the base centre (the middle of the three omniwheels) to the tag cen
 python table_perception.py calibrate-extrinsics --tag-x 0.60 --tag-y 0.0
 ```
 
-Check the printed camera position against a tape measure.
+Check the printed camera position against a tape measure. A tag standing upright facing the robot also works
+(`--tag-mount vertical --tag-z <centre height>`), but flat is more accurate: any lean of the holder goes into the
+camera pitch. Nothing is saved if the median reprojection is over 2 px, which usually means the wrong `--tag-mount`.
 
 ## 4. Tag on the table
 

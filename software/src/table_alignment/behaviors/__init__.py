@@ -7,6 +7,7 @@ from .align_to_table import (
     AlignToTable,
     AxisConfig,
     body_displacement,
+    margin_scale,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "AlignToTable",
     "AxisConfig",
     "body_displacement",
+    "margin_scale",
 ]

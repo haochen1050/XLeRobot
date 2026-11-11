@@ -8,8 +8,10 @@ with detected tags drawn, for checking what the camera sees. Steps, in order:
 
   1. capture-charuco       Save views of the ChArUco board held in front of the camera.
   2. calibrate-intrinsics  Camera matrix + distortion from those views.
-     (Intel RealSense: `realsense-intrinsics` reads the factory calibration instead of steps 1-2.)
-  3. calibrate-extrinsics  Camera pose on the robot, from the AprilTag lying flat at a measured floor spot.
+     (Factory calibration instead of steps 1-2: `realsense-intrinsics` for an Intel RealSense,
+     `orbbec-intrinsics` for an Orbbec camera such as the Femto Bolt.)
+  3. calibrate-extrinsics  Camera pose on the robot, from the AprilTag at a measured spot (flat, or upright
+                           with --tag-mount vertical).
      Needs the head pose saved first (head_pose.py capture); steps 3 and 5 check the head is still there.
   4. watch                 Print distance / lateral / heading errors to the table tag.
   5. teach                 Park the robot at the desired pose by hand and record it as the target.
@@ -24,7 +26,9 @@ Example:
   python table_perception.py teach --tag-edge-offset 0.10
 
 --camera is "realsense" (the only one connected), "realsense:<serial>", or a V4L2 device path. It goes before the
-subcommand.
+subcommand. A V4L2 camera is opened at --size and --fourcc (default 640x480 in the camera's default format; an
+Orbbec Femto Bolt needs e.g. --size 1280x720 --fourcc MJPG). The calibration only holds at the size it was made at:
+later steps read it from the intrinsics file.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from xlerobot_table_alignment.behaviors import AlignConfig
+from xlerobot_table_alignment.behaviors import AlignConfig, margin_scale
 from xlerobot_table_alignment.head import HeadHold, HeadMovedError, HeadPose, open_head_bus
 from xlerobot_table_alignment.perception import (
     TAG_MOUNTS,
@@ -62,8 +66,13 @@ from xlerobot_table_alignment.perception import (
 from xlerobot_table_alignment.perception.geometry import average_transforms, pose_xyz_yaw
 
 OUT = Path("outputs/table_alignment")
-# Warn at teach time when the tag sits this close to the image edge at the target pose.
+# Warn at teach time when the tag sits this close to the image edge at the target pose (at 640 px wide).
 MIN_TEACH_MARGIN_PX = 60
+# The estimator's default limit: beyond it, every frame would be rejected.
+MAX_CALIBRATION_REPROJECTION_PX = 2.0
+DEFAULT_SIZE = (640, 480)
+# Empty: the camera's default pixel format (RealSense always streams bgr8).
+DEFAULT_FOURCC = ""
 DEFAULTS = {
     "camera": "realsense",
     "head_port": "/dev/ttyACM0",
@@ -78,13 +87,27 @@ logger = logging.getLogger("table_perception")
 
 
 class V4L2Camera:
-    def __init__(self, device: str, width: int, height: int, fps: int):
+    def __init__(self, device: str, width: int, height: int, fps: int, fourcc: str = DEFAULT_FOURCC):
         self.cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera {device} (is another process using it?)")
+        # Pixel format first: it decides which sizes and frame rates are on offer.
+        if fourcc:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
+        # V4L2 quietly picks the nearest mode it has, and a calibration from another size is wrong.
+        actual = (
+            round(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            round(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        )
+        if actual != (width, height):
+            self.cap.release()
+            raise RuntimeError(
+                f"{device} gave {actual[0]}x{actual[1]} when asked for {width}x{height} {fourcc or '(default format)'}. "
+                f"List its modes with: v4l2-ctl -d {device} --list-formats-ext"
+            )
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         return self.cap.read()
@@ -118,18 +141,27 @@ class RealSenseCamera:
         self._pipeline.stop()
 
 
-def open_camera(device: str, width: int, height: int, fps: int):
+def open_camera(device: str, width: int, height: int, fps: int, fourcc: str = DEFAULT_FOURCC):
     kind, _, serial = device.partition(":")
     if kind == "realsense":
         return RealSenseCamera(serial or None, width, height, fps)
-    return V4L2Camera(device, width, height, fps)
+    return V4L2Camera(device, width, height, fps, fourcc)
 
 
 class LatestFrame:
     """Background reader that keeps only the newest frame, so callers never see a buffered stale one."""
 
-    def __init__(self, device: str, width: int = 640, height: int = 480, fps: int = 30):
-        self.cap = open_camera(device, width, height, fps)
+    def __init__(
+        self,
+        device: str,
+        width: int = DEFAULT_SIZE[0],
+        height: int = DEFAULT_SIZE[1],
+        fps: int = 30,
+        fourcc: str = DEFAULT_FOURCC,
+    ):
+        self.cap = open_camera(device, width, height, fps, fourcc)
+        self.last_error: str | None = None
+        self.bad_frames = 0
         self._lock = threading.Lock()
         self._frame: tuple[np.ndarray, float] | None = None
         self._running = True
@@ -138,7 +170,14 @@ class LatestFrame:
 
     def _loop(self) -> None:
         while self._running:
-            ok, image = self.cap.read()
+            try:
+                ok, image = self.cap.read()
+            except cv2.error as e:
+                # OpenCV raises on an empty MJPEG frame. One bad frame must not end the reader; callers see the
+                # frames stop arriving and report them as stale.
+                self.last_error = str(e).strip()
+                self.bad_frames += 1
+                ok = False
             if ok:
                 with self._lock:
                     self._frame = (image, time.monotonic())
@@ -153,7 +192,10 @@ class LatestFrame:
         deadline = time.monotonic() + timeout_s
         while self() is None:
             if time.monotonic() > deadline:
-                raise RuntimeError("No frames from camera")
+                detail = (
+                    f" ({self.bad_frames} bad frames, last: {self.last_error})" if self.bad_frames else ""
+                )
+                raise RuntimeError(f"No frames from camera{detail}")
             time.sleep(0.05)
 
     def close(self) -> None:
@@ -173,7 +215,7 @@ def cmd_capture_charuco(args) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100))
-    cam = LatestFrame(args.camera)
+    cam = LatestFrame(args.camera, *args.size, fourcc=args.fourcc)
     cam.wait_first()
     print(
         f"Hold the board in view and move it between saves: near/far, all image corners, tilted ~30 deg.\n"
@@ -272,6 +314,145 @@ def cmd_realsense_intrinsics(args) -> None:
     print(f"Saved {args.out}")
 
 
+ORBBEC_COEFFICIENTS = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2")
+
+
+def orbbec_distortion_to_opencv(distortion, models) -> np.ndarray:
+    """OpenCV's coefficient order for an Orbbec distortion model, or SystemExit for one it has no match for."""
+    d = distortion
+    if d.model == models.NONE:
+        if any(getattr(d, name) for name in ORBBEC_COEFFICIENTS):
+            raise SystemExit(f"{d} reports no distortion but has coefficients; use capture-charuco instead")
+        return np.zeros(5)
+    if d.model == models.BROWN_CONRADY:
+        return np.array([d.k1, d.k2, d.p1, d.p2, d.k3], dtype=float)
+    if d.model == models.BROWN_CONRADY_K6:
+        return np.array([d.k1, d.k2, d.p1, d.p2, d.k3, d.k4, d.k5, d.k6], dtype=float)
+    raise SystemExit(
+        f"Distortion model {d.model} has no OpenCV equivalent here; use capture-charuco / calibrate-intrinsics"
+    )
+
+
+def orbbec_projection_mismatch_px(ob, intrinsic, distortion, K: np.ndarray, coeffs: np.ndarray) -> float:
+    """Largest gap between the SDK's projection and OpenCV's with ``coeffs``, over most of the image.
+
+    This checks that the coefficients are passed to OpenCV correctly, not that they fit the lens. The SDK's
+    function only applies distortion for the model labelled BROWN_CONRADY (its formula has the k4-k6 terms as
+    well) and returns no distortion for any other, so it is asked for that model.
+    """
+    labelled = ob.OBCameraDistortion()
+    for name in ORBBEC_COEFFICIENTS:
+        setattr(labelled, name, getattr(distortion, name))
+    labelled.model = ob.OBCameraDistortionModel.BROWN_CONRADY
+
+    corners = np.array(
+        [[0, 0], [intrinsic.width, 0], [0, intrinsic.height], [intrinsic.width, intrinsic.height]],
+        dtype=float,
+    )
+    # Short of the corners: the SDK flags points that distortion carries outside the image.
+    span = 0.9 * np.abs((corners - [intrinsic.cx, intrinsic.cy]) / [intrinsic.fx, intrinsic.fy]).max(axis=0)
+    xs, ys = np.meshgrid(np.linspace(-span[0], span[0], 17), np.linspace(-span[1], span[1], 13))
+    rays = np.stack([xs.ravel(), ys.ravel(), np.ones(xs.size)], axis=1)
+
+    no_motion = ob.OBExtrinsic()
+    no_motion.rot = np.eye(3, dtype=np.float32)
+    no_motion.transform = np.zeros(3, dtype=np.float32)
+    # The SDK works in millimetres; the point is 1 m along each ray.
+    sdk_points = [
+        ob.transformation3dto2d(
+            ob.OBPoint3f(*(float(v) * 1000.0 for v in ray)), intrinsic, labelled, no_motion
+        )
+        for ray in rays
+    ]
+    sdk_px = np.array([[point.x, point.y] for point in sdk_points])
+    cv_px = cv2.projectPoints(rays, np.zeros(3), np.zeros(3), K, coeffs)[0].reshape(-1, 2)
+    return float(np.abs(cv_px - sdk_px).max())
+
+
+def cmd_orbbec_intrinsics(args) -> None:
+    """Factory colour intrinsics of an Orbbec camera, saved in the ChArUco calibration format."""
+    try:
+        import pyorbbecsdk as ob
+    except ImportError as e:
+        raise SystemExit(
+            "pyorbbecsdk is not installed: pip install --no-deps pyorbbecsdk2\n"
+            "(--no-deps: its examples' pinned packages are not needed and can break this environment)"
+        ) from e
+
+    # Keep the context: the device list and devices stop working once it is freed.
+    context = ob.Context()
+    devices = context.query_devices()
+    if args.serial:
+        device = devices.get_device_by_serial_number(args.serial)
+    elif devices.get_count() == 1:
+        device = devices.get_device_by_index(0)
+    else:
+        raise SystemExit(
+            f"Expected one Orbbec device (--serial for several), found {devices.get_count()}. "
+            "If it is plugged in, its udev rule may be missing: see the SDK's shared/install_udev_rules.sh"
+        )
+    info = device.get_device_info()
+
+    pipeline = ob.Pipeline(device)
+    profiles = pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR)
+    format_ = getattr(ob.OBFormat, args.format)
+    config = ob.Config()
+    config.enable_stream(profiles.get_video_stream_profile(args.width, args.height, format_, args.fps))
+    # Read from a frame of the running stream, as Orbbec's examples do: the values may not be valid before that.
+    pipeline.start(config)
+    try:
+        color = None
+        for _ in range(10):
+            frames = pipeline.wait_for_frames(1000)
+            color = frames.get_color_frame() if frames is not None else None
+            if color is not None:
+                break
+        if color is None:
+            raise SystemExit("No colour frame from the camera in 10 s; is the host program still running?")
+        profile = color.get_stream_profile().as_video_stream_profile()
+        intrinsic, distortion = profile.get_intrinsic(), profile.get_distortion()
+    finally:
+        pipeline.stop()
+
+    K = np.array([[intrinsic.fx, 0.0, intrinsic.cx], [0.0, intrinsic.fy, intrinsic.cy], [0.0, 0.0, 1.0]])
+    # Orbbec reports zeros from some firmware instead of failing.
+    if (
+        intrinsic.fx <= 0
+        or intrinsic.fy <= 0
+        or not (0 < intrinsic.cx < args.width and 0 < intrinsic.cy < args.height)
+        or (intrinsic.width, intrinsic.height) != (args.width, args.height)
+    ):
+        raise SystemExit(
+            f"Invalid factory intrinsics {intrinsic} on firmware {info.get_firmware_version()}: "
+            "update the firmware, or use capture-charuco / calibrate-intrinsics"
+        )
+    coeffs = orbbec_distortion_to_opencv(distortion, ob.OBCameraDistortionModel)
+    # As for RealSense: check the coefficient order numerically instead of trusting the model's name.
+    mismatch_px = orbbec_projection_mismatch_px(ob, intrinsic, distortion, K, coeffs)
+    if mismatch_px > 0.25:
+        raise SystemExit(
+            f"Distortion {distortion} differs from OpenCV's projection by up to {mismatch_px:.2f} px; "
+            "use capture-charuco / calibrate-intrinsics instead"
+        )
+
+    CameraIntrinsics(K, coeffs, (args.width, args.height)).save(args.out)
+    print(f"{info.get_name()} serial {info.get_serial_number()} firmware {info.get_firmware_version()}")
+    print(
+        f"fx={intrinsic.fx:.1f} fy={intrinsic.fy:.1f} cx={intrinsic.cx:.1f} cy={intrinsic.cy:.1f}  "
+        f"size={args.width}x{args.height}"
+    )
+    print(
+        f"model={distortion.model} dist={np.round(coeffs, 4).tolist()} "
+        f"(matches the SDK's distortion formula to {mismatch_px:.3f} px)"
+    )
+    fov = [
+        math.degrees(2 * math.atan(n / (2 * f)))
+        for n, f in ((args.width, intrinsic.fx), (args.height, intrinsic.fy))
+    ]
+    print(f"Field of view {fov[0]:.0f} x {fov[1]:.0f} deg")
+    print(f"Saved {args.out}")
+
+
 def describe_camera(T_base_cam: np.ndarray) -> str:
     x, y, z = T_base_cam[:3, 3]
     optical = T_base_cam[:3, 2]
@@ -285,7 +466,13 @@ def describe_camera(T_base_cam: np.ndarray) -> str:
     )
 
 
-def collect_tag_poses(cam: LatestFrame, detector: AprilTagDetector, tag_id: int | None, frames: int) -> list:
+def collect_tag_poses(
+    cam: LatestFrame,
+    detector: AprilTagDetector,
+    tag_id: int | None,
+    frames: int,
+    up_in_tag: np.ndarray = np.array([0.0, 0.0, 1.0]),
+) -> list:
     poses, last_t = [], None
     deadline = time.monotonic() + 10 + frames / 5
     while len(poses) < frames and time.monotonic() < deadline:
@@ -298,7 +485,9 @@ def collect_tag_poses(cam: LatestFrame, detector: AprilTagDetector, tag_id: int 
         if len(found) == 1:
             # Rough prior (camera looking forward, pitched ~45 deg down) to pick the right one of the two
             # planar PnP solutions; it only needs to be on the correct side.
-            poses.append(detector.solve(*found[0], up_in_cam=np.array([0.0, -0.7071, -0.7071])))
+            poses.append(
+                detector.solve(*found[0], up_in_cam=np.array([0.0, -0.7071, -0.7071]), up_in_tag=up_in_tag)
+            )
     return poses
 
 
@@ -319,22 +508,47 @@ def cmd_calibrate_extrinsics(args) -> None:
     require_head_pose(args)
     intr = CameraIntrinsics.load(args.intrinsics)
     detector = AprilTagDetector(intr, args.tag_size)
-    cam = LatestFrame(args.camera, *intr.image_size)
+    cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
+    yaw = (
+        args.tag_yaw_deg if args.tag_yaw_deg is not None else (0.0 if args.tag_mount == "vertical" else -90.0)
+    )
+    if args.tag_mount == "vertical":
+        placement = TagPlacement(
+            x_m=args.tag_x,
+            y_m=args.tag_y,
+            yaw_deg=yaw,
+            size_m=args.tag_size,
+            mount="vertical",
+            z_m=args.tag_z,
+        )
+        T_base_tag, up_in_tag = placement.T_table_tag(), placement.up_in_tag()
+    else:
+        T_base_tag, up_in_tag = (
+            pose_xyz_yaw(args.tag_x, args.tag_y, args.tag_z, yaw),
+            np.array([0.0, 0.0, 1.0]),
+        )
     try:
         cam.wait_first()
-        observations = collect_tag_poses(cam, detector, args.tag_id, args.frames)
+        observations = collect_tag_poses(cam, detector, args.tag_id, args.frames, up_in_tag)
     finally:
         cam.close()
     if len(observations) < args.frames // 2:
         raise SystemExit(f"Tag seen in only {len(observations)} frames; check it is in view and well lit")
 
     reproj = np.median([o.reprojection_px for o in observations])
-    T_base_tag = pose_xyz_yaw(args.tag_x, args.tag_y, args.tag_z, args.tag_yaw_deg)
+    # The estimator would reject every frame anyway. The usual cause is the wrong mount: the solver is steered to
+    # the wrong one of a planar tag's two poses, and that pose fits the corners badly.
+    if reproj > MAX_CALIBRATION_REPROJECTION_PX:
+        raise SystemExit(
+            f"Nothing saved: median reprojection {reproj:.2f} px (limit {MAX_CALIBRATION_REPROJECTION_PX:g}). "
+            f"The tag was taken to be {args.tag_mount}; check --tag-mount and --tag-size, and the tag is flat and square."
+        )
     T_base_cam = solve_base_from_camera(average_transforms([o.T_cam_tag for o in observations]), T_base_tag)
     save_transform(
         args.extrinsics,
         T_base_cam,
-        tag_pose_in_base=[args.tag_x, args.tag_y, args.tag_z, args.tag_yaw_deg],
+        tag_pose_in_base=[args.tag_x, args.tag_y, args.tag_z, yaw],
+        tag_mount=args.tag_mount,
         frames=len(observations),
         median_reprojection_px=float(reproj),
     )
@@ -349,10 +563,10 @@ def cmd_calibrate_extrinsics(args) -> None:
     # of 90 deg relative to --tag-yaw-deg (the printed tag has no obvious "top").
     cam_yaw = math.degrees(math.atan2(T_base_cam[1, 2], T_base_cam[0, 2]))
     if abs(cam_yaw) > 45:
-        suggested = (args.tag_yaw_deg - 90 * round(cam_yaw / 90) + 180) % 360 - 180
+        suggested = (yaw - 90 * round(cam_yaw / 90) + 180) % 360 - 180
         print(
             f"WARNING: camera yaw {cam_yaw:+.0f} deg - the tag is probably rotated relative to "
-            f"--tag-yaw-deg {args.tag_yaw_deg:g}. Re-run with --tag-yaw-deg {suggested:g}, and use the same "
+            f"--tag-yaw-deg {yaw:g}. Re-run with --tag-yaw-deg {suggested:g}, and use the same "
             f"value for watch/teach while the tag stays in this orientation."
         )
 
@@ -432,7 +646,7 @@ def load_target(args) -> TableTarget:
 def cmd_watch(args) -> None:
     target = load_target(args)
     intr = CameraIntrinsics.load(args.intrinsics)
-    cam = LatestFrame(args.camera, *intr.image_size)
+    cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
     estimator = make_estimator(args, cam, target)
     print("Errors: + distance -> drive forward, + lateral -> strafe left, + heading -> rotate CCW")
     try:
@@ -461,7 +675,7 @@ def cmd_watch(args) -> None:
 def cmd_teach(args) -> None:
     require_head_pose(args)
     intr = CameraIntrinsics.load(args.intrinsics)
-    cam = LatestFrame(args.camera, *intr.image_size)
+    cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
     estimator = make_estimator(args, cam, TableTarget(reference_x_m=args.reference_x))
     samples: list[TableMeasurement] = []
     margins: list[float] = []
@@ -499,16 +713,17 @@ def cmd_teach(args) -> None:
     print(f"Saved {args.target}")
     margin = float(np.median(margins))
     print(f"Tag corners are {margin:.0f} px from the image edge at the target pose.")
-    if margin < MIN_TEACH_MARGIN_PX:
+    scale = margin_scale(intr.image_size)
+    if margin < MIN_TEACH_MARGIN_PX * scale:
         print(
-            f"WARNING: less than {MIN_TEACH_MARGIN_PX} px. Alignment keeps the tag at least "
-            f"{AlignConfig.view_margin_px:g} px inside the image, so corrections near the target may be blocked. "
+            f"WARNING: less than {MIN_TEACH_MARGIN_PX * scale:g} px. Alignment keeps the tag at least "
+            f"{AlignConfig.view_margin_px * scale:g} px inside the image, so corrections near the target may be blocked. "
             "Move the tag towards the image centre (or re-aim the camera) and re-teach."
         )
 
 
 def cmd_snapshot(args) -> None:
-    cam = LatestFrame(args.camera)
+    cam = LatestFrame(args.camera, *args.size, fourcc=args.fourcc)
     try:
         cam.wait_first()
         time.sleep(0.5)  # let auto-exposure settle
@@ -532,8 +747,24 @@ def head_args(sp) -> None:
     sp.add_argument("--head-pose", default=str(DEFAULTS["head_pose"]))
 
 
+def parse_size(text: str) -> tuple[int, int]:
+    width, _, height = text.partition("x")
+    return int(width), int(height)
+
+
 def add_camera_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--camera", default=DEFAULTS["camera"])
+    p.add_argument(
+        "--size",
+        type=parse_size,
+        default=DEFAULT_SIZE,
+        help="WIDTHxHEIGHT for snapshot and capture-charuco; later steps use the size in the intrinsics file",
+    )
+    p.add_argument(
+        "--fourcc",
+        default=DEFAULT_FOURCC,
+        help="V4L2 pixel format to request, e.g. MJPG; empty for the camera's default (ignored for RealSense)",
+    )
     p.add_argument("--intrinsics", default=str(DEFAULTS["intrinsics"]))
     p.add_argument("--extrinsics", default=str(DEFAULTS["extrinsics"]))
 
@@ -622,17 +853,37 @@ def parse_args():
     sp.add_argument("--out", default=str(DEFAULTS["intrinsics"]))
     sp.set_defaults(func=cmd_realsense_intrinsics)
 
+    sp = sub.add_parser(
+        "orbbec-intrinsics", help="Read factory colour intrinsics from an Orbbec camera (replaces steps 1-2)"
+    )
+    sp.add_argument("--serial", default=None, help="Serial number (needed if several are connected)")
+    sp.add_argument(
+        "--width", type=int, default=1280, help="Must match the size the scripts capture at"
+    )
+    sp.add_argument("--height", type=int, default=720)
+    sp.add_argument("--fps", type=int, default=30)
+    sp.add_argument("--format", default="MJPG", help="Colour stream format, an OBFormat name (MJPG, YUYV, ...)")
+    sp.add_argument("--out", default=str(DEFAULTS["intrinsics"]))
+    sp.set_defaults(func=cmd_orbbec_intrinsics)
+
     sp = sub.add_parser("calibrate-extrinsics")
     tag_args(sp)
     head_args(sp)
     sp.add_argument("--tag-x", type=float, required=True, help="Tag centre forward of the base centre (m)")
     sp.add_argument("--tag-y", type=float, default=0.0, help="Tag centre left of the base centre (m)")
-    sp.add_argument("--tag-z", type=float, default=0.0, help="Tag height above the floor (m)")
+    sp.add_argument("--tag-z", type=float, default=0.0, help="Tag centre height above the floor (m)")
+    sp.add_argument(
+        "--tag-mount",
+        choices=TAG_MOUNTS,
+        default="flat",
+        help="flat: lying face up. vertical: standing upright, facing the robot",
+    )
     sp.add_argument(
         "--tag-yaw-deg",
         type=float,
-        default=-90.0,
-        help="-90: printed top points away from the robot; 0: printed top points to the robot's left",
+        default=None,
+        help="Rotation about the face normal. Flat (default -90): -90 = printed top points away from the robot, "
+        "0 = to its left. Vertical (default 0): 0 = printed top points up",
     )
     sp.add_argument("--frames", type=int, default=30)
     sp.set_defaults(func=cmd_calibrate_extrinsics)

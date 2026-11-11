@@ -43,7 +43,7 @@ class FakeBus:
 
 
 class FakeCamera:
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         self.closed = False
 
     def wait_first(self):
