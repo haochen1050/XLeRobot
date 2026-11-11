@@ -57,7 +57,6 @@ def open_head_bus(port: str) -> Any:
     """Connect to ``port`` and verify it is the head bus. Nothing is written to any motor."""
     from lerobot.motors import Motor, MotorNormMode
     from lerobot.motors.feetech import FeetechMotorsBus
-    from lerobot.motors.feetech.tables import MODEL_NUMBER_TABLE
 
     motors = {
         name: Motor(id=id_, model=HEAD_MOTOR_MODEL, norm_mode=MotorNormMode.RANGE_M100_100)
@@ -66,7 +65,7 @@ def open_head_bus(port: str) -> Any:
     bus = FeetechMotorsBus(port=port, motors=motors)
     bus.connect(handshake=False)
     try:
-        expected = MODEL_NUMBER_TABLE[HEAD_MOTOR_MODEL]
+        expected = bus.model_number_table[HEAD_MOTOR_MODEL]
         found = {name: bus.ping(name, num_retry=2) for name in motors}
         if any(model != expected for model in found.values()):
             raise HeadBusMismatchError(f"{port} is not the head bus: expected {expected} on {HEAD_IDS}, got {found}")

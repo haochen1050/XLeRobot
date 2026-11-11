@@ -128,7 +128,11 @@ def test_close_keeps_the_torque_on():
 def test_open_head_bus_rejects_the_wrong_bus_without_writing(monkeypatch, answering, match):
     disconnected = []
 
+    from lerobot.motors.feetech import FeetechMotorsBus
+
     class FakeFeetech:
+        model_number_table = FeetechMotorsBus.model_number_table
+
         def __init__(self, port, motors):
             self.ids = {name: motor.id for name, motor in motors.items()}
 

@@ -292,7 +292,6 @@ def open_wheel_bus(
     """
     from lerobot.motors import Motor, MotorNormMode
     from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
-    from lerobot.motors.feetech.tables import MODEL_NUMBER_TABLE
 
     motors = {
         name: Motor(id=id_, model=motor_model, norm_mode=MotorNormMode.RANGE_M100_100)
@@ -301,7 +300,8 @@ def open_wheel_bus(
     bus = FeetechMotorsBus(port=port, motors=motors)
     bus.connect(handshake=False)
     try:
-        expected = MODEL_NUMBER_TABLE[motor_model]
+        # From the bus class: the module holding this table moved between lerobot versions.
+        expected = bus.model_number_table[motor_model]
         found = {name: bus.ping(name, num_retry=2) for name in motors}
         bad = {name: model for name, model in found.items() if model != expected}
         if bad:
