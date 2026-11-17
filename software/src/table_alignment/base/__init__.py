@@ -26,6 +26,7 @@ from .base_controller import (
     BaseStopError,
     StopResult,
     WheelBusMismatchError,
+    motor_model_number,
     open_wheel_bus,
 )
 from .omni_kinematics import body_to_wheel_raw, wheel_raw_to_body
@@ -43,6 +44,7 @@ __all__ = [
     "StopResult",
     "WheelBusMismatchError",
     "body_to_wheel_raw",
+    "motor_model_number",
     "open_wheel_bus",
     "wheel_raw_to_body",
 ]

@@ -60,12 +60,13 @@ from xlerobot_table_alignment.base import (
     BaseLimits,
     open_wheel_bus,
 )
-from xlerobot_table_alignment.behaviors import AXES, ERROR_FIELD, AlignConfig, AlignToTable
+from xlerobot_table_alignment.behaviors import AXES, ERROR_FIELD, AlignConfig, AlignState, AlignToTable
 from xlerobot_table_alignment.head import HeadGuardedBase, HeadHold, HeadMovedError, HeadPose, open_head_bus
 from xlerobot_table_alignment.perception import CameraIntrinsics, table_pose_error
 
 DEFAULT_PORT = "/dev/ttyACM1"
 
+RETRY_PAUSE_S = 1.0
 logger = logging.getLogger("align_to_table")
 
 
@@ -93,6 +94,13 @@ def parse_args():
         "--dry-run", action="store_true", help="Measure and print the first planned pulse; no motion"
     )
     p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    p.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Start again up to this many times after a fault that left the base stopped (not after Ctrl-C, an "
+        "unconfirmed stop or a moved head). You are asked to confirm only once",
+    )
     p.add_argument("--log-dir", default=str(OUT / "logs"))
     p.add_argument(
         "--note", default="", help="Free text saved with the trial (e.g. the start spot), for reports"
@@ -169,6 +177,24 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     signal.signal(signal.SIGTERM, _raise_interrupt)
     signal.signal(signal.SIGHUP, _raise_interrupt)
+    if args.retries < 0:
+        raise SystemExit("--retries must be >= 0")
+    try:
+        for attempt in range(args.retries + 1):
+            # Only a controller fault with the base stopped is retried: never Ctrl-C, an unconfirmed stop, a moved
+            # head or a refused start. Each attempt is a full run with its own limits and its own log.
+            exit_code, retryable = run_once(args, attempt)
+            if not retryable or attempt == args.retries:
+                return exit_code
+            print(f"\nRetry {attempt + 1} of {args.retries} in {RETRY_PAUSE_S:g} s (Ctrl+C aborts)")
+            time.sleep(RETRY_PAUSE_S)
+    except KeyboardInterrupt:
+        print("Aborted")
+    return 1
+
+
+def run_once(args, attempt: int = 0) -> tuple[int, bool]:
+    """One alignment run. Returns (exit code, whether a retry makes sense)."""
 
     axes = tuple(a.strip() for a in args.axes.split(",") if a.strip())
     config = AlignConfig(
@@ -193,20 +219,23 @@ def main() -> int:
     if (mismatch := target_placement_mismatch(args)) is not None:
         raise SystemExit(f"Refusing to align: {mismatch}. Use the same tag options or re-teach.")
     target = load_target(args)
-    if not Path(args.head_pose).exists():
-        raise SystemExit(f"No saved head pose at {args.head_pose}; run head_pose.py capture first")
-    head_pose = HeadPose.load(args.head_pose)
-
-    head = HeadHold(open_head_bus(args.head_port))
-    try:
-        # A dry run only reads the head; a real run holds it too.
-        (head.check if args.dry_run else head.engage)(head_pose)
-    except HeadMovedError as e:
-        head.close()
-        raise SystemExit(f"Refusing to align: {e}") from e
-    except BaseException:
-        head.close()
-        raise
+    head = head_pose = None
+    if args.no_head:
+        logger.info("--no-head: camera taken as fixed to the robot, head pose not checked")
+    else:
+        if not Path(args.head_pose).exists():
+            raise SystemExit(f"No saved head pose at {args.head_pose}; run head_pose.py capture first")
+        head_pose = HeadPose.load(args.head_pose)
+        head = HeadHold(open_head_bus(args.head_port))
+        try:
+            # A dry run only reads the head; a real run holds it too.
+            (head.check if args.dry_run else head.engage)(head_pose)
+        except HeadMovedError as e:
+            head.close()
+            raise SystemExit(f"Refusing to align: {e}") from e
+        except BaseException:
+            head.close()
+            raise
 
     intr = CameraIntrinsics.load(args.intrinsics)
     cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
@@ -259,9 +288,9 @@ def main() -> int:
                         plan = f"first pulse speed {max(-ax.max_speed, min(ax.max_speed, ax.gain * e)):+.3f}"
                     print(f"  {axis}: error {e:+.3f}, tolerance {ax.tolerance}, {plan}")
             print("Dry run: no motion.")
-            return 0
+            return 0, False
 
-        if not args.yes:
+        if not args.yes and attempt == 0:
             input(
                 "Base will move in short pulses. Hand on the power cutoff? Press Enter to start (Ctrl+C aborts). "
             )
@@ -281,8 +310,10 @@ def main() -> int:
 
         log_dir = Path(args.log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"align_{time.strftime('%Y%m%d_%H%M%S')}_{'-'.join(axes)}.jsonl"
+        suffix = f"_retry{attempt}" if attempt else ""
+        log_path = log_dir / f"align_{time.strftime('%Y%m%d_%H%M%S')}_{'-'.join(axes)}{suffix}.jsonl"
         exit_code = 1
+        retryable = False
         with log_path.open("w") as log_file:
 
             def log(event: dict) -> None:
@@ -296,11 +327,13 @@ def main() -> int:
                     "target": asdict(target),
                     "tag": vars(args),
                     "note": args.note,
+                    "attempt": attempt,
                 }
             )
             log(initial)
             try:
-                result = AlignToTable(HeadGuardedBase(base, head, head_pose), estimator, config, log=log).run()
+                guarded = base if head is None else HeadGuardedBase(base, head, head_pose)
+                result = AlignToTable(guarded, estimator, config, log=log).run()
                 print(
                     f"\n{result.state.value} after {result.steps} pulses in {result.duration_s:.0f} s. {result.reason}"
                 )
@@ -313,7 +346,13 @@ def main() -> int:
                     f"recoveries {summary['recoveries']}"
                 )
                 exit_code = 0 if result.ready else 1
-                if result.ready:
+                retryable = result.state is AlignState.FAULT and "stop not confirmed" not in result.reason
+                if retryable and head is not None:
+                    try:
+                        head.check(head_pose)
+                    except HeadMovedError:
+                        retryable = False
+                if result.ready and head is not None:
                     # The head is checked before each pulse; this catches a move after the last one.
                     try:
                         head.check(head_pose)
@@ -328,15 +367,17 @@ def main() -> int:
                 if not stop.confirmed:
                     logger.critical("Final stop not confirmed - CUT BASE POWER")
                     exit_code = 2
+                    retryable = False
                 try:
                     bus.disconnect(disable_torque=True)
                 except Exception:
                     logger.exception("Disconnect / torque disable failed")
         print(f"Log: {log_path}")
-        return exit_code
+        return exit_code, retryable
     finally:
         cam.close()
-        head.close()
+        if head is not None:
+            head.close()
 
 
 if __name__ == "__main__":

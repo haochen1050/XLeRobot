@@ -434,3 +434,82 @@ def test_estimator_reads_the_same_pose_at_the_bolt_resolution(monkeypatch):
     assert err.lateral_error_m == pytest.approx(expected.lateral_error_m, abs=0.015)
     assert err.heading_error_deg == pytest.approx(expected.heading_error_deg, abs=1.0)
     assert 0 < estimator.last_tag_margin_px < 720
+
+
+# ------------------------------------------------------------------ cube
+
+
+def cube_detections(placement, T_base_table, ids, noise_px=0.0, seed=0):
+    """Exact (optionally noisy) pixel corners of the given cube faces, as the detector would report them."""
+    from xlerobot_table_alignment.perception.apriltag_table_estimator import tag_object_points
+
+    rng = np.random.default_rng(seed)
+    T_cam_cube = invert(T_BASE_CAM) @ T_base_table @ placement.T_table_tag()
+    out = []
+    for tag_id in ids:
+        T = T_cam_cube @ placement.cube_face_poses()[tag_id]
+        pts = (T[:3, :3] @ tag_object_points(placement.size_m).T.astype(float)).T + T[:3, 3]
+        px = (K @ (pts / pts[:, 2:]).T).T[:, :2]
+        out.append((tag_id, px + rng.normal(0, noise_px, px.shape) if noise_px else px))
+    return out
+
+
+CUBE = TagPlacement(
+    x_m=0.25, mount="cube", yaw_deg=0.0, cube_faces=(("top", 5), ("front", 2), ("left", 1), ("right", 3))
+)
+
+
+def test_cube_face_layout_matches_the_measured_cube():
+    # Measured on the robot: the front tag sits 6.5 cm in front of and 6.5 cm below the top tag's centre, facing
+    # along the top tag's +x with its printed top along the top tag's +z.
+    faces = CUBE.cube_face_poses()
+    T_top_front = invert(faces[5]) @ faces[2]
+    np.testing.assert_allclose(T_top_front[:3, 3], [0.065, 0.0, -0.065], atol=1e-9)
+    np.testing.assert_allclose(T_top_front[:3, 2], [1, 0, 0], atol=1e-9)
+    np.testing.assert_allclose(T_top_front[:3, 1], [0, 0, 1], atol=1e-9)
+    # Every side tag faces outwards with its printed top up.
+    for tag_id, outward in ((2, [-1, 0, 0]), (1, [0, 1, 0]), (3, [0, -1, 0])):
+        np.testing.assert_allclose(faces[tag_id][:3, 2], outward, atol=1e-9)
+        np.testing.assert_allclose(faces[tag_id][:3, 1], [0, 0, 1], atol=1e-9)
+        np.testing.assert_allclose(faces[tag_id][:3, 3], np.array(outward) * 0.065 + [0, 0, 0.065], atol=1e-9)
+
+
+@pytest.mark.parametrize("ids", [(5,), (2,), (5, 2), (5, 2, 1), (5, 3)])
+@pytest.mark.parametrize(("x", "y", "yaw_deg"), [(0.70, 0.0, 0.0), (0.75, 0.10, 12.0), (0.85, -0.12, -20.0)])
+def test_cube_gives_the_same_table_pose_from_any_of_its_faces(ids, x, y, yaw_deg):
+    target = TableTarget(distance_m=0.30)
+    T_base_table = pose_xyz_yaw(x, y, 0.40, yaw_deg)
+    est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, CUBE, target, clock=lambda: 0.0)
+    est.detector.detect = lambda image: cube_detections(CUBE, T_base_table, ids) + [(9, np.zeros((4, 2)))]
+    measured = est.estimate(np.zeros((H, W, 3), np.uint8), 0.0)
+    expected = table_pose_error(T_base_table, target, 0.0)
+    assert measured.valid, measured.reason
+    assert measured.distance_error_m == pytest.approx(expected.distance_error_m, abs=1e-3)
+    assert measured.lateral_error_m == pytest.approx(expected.lateral_error_m, abs=1e-3)
+    assert measured.heading_error_deg == pytest.approx(expected.heading_error_deg, abs=0.1)
+    # The view prediction follows the faces that were seen.
+    assert est.predict_tag_margin(0, 0, 0) == pytest.approx(est.last_tag_margin_px, abs=0.5)
+
+
+def test_two_cube_faces_are_steadier_than_one_under_corner_noise():
+    T_base_table = pose_xyz_yaw(0.75, 0.05, 0.40, 5.0)
+    spread = {}
+    for ids in ((5,), (5, 2)):
+        headings = []
+        for seed in range(40):
+            est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, CUBE, TableTarget(), clock=lambda: 0.0)
+            est.detector.detect = lambda image, s=seed, i=ids: cube_detections(CUBE, T_base_table, i, 0.5, s)
+            err = est.estimate(np.zeros((H, W, 3), np.uint8), 0.0)
+            assert err.valid, err.reason
+            headings.append(err.heading_error_deg)
+        spread[ids] = float(np.std(headings))
+    assert spread[(5, 2)] < spread[(5,)]
+
+
+def test_cube_rejects_no_known_face_and_duplicate_ids():
+    est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, CUBE, TableTarget(), clock=lambda: 0.0)
+    T_base_table = pose_xyz_yaw(0.75, 0.0, 0.40, 0.0)
+    est.detector.detect = lambda image: [(9, np.zeros((4, 2)))]
+    assert "cube tags" in est.estimate(np.zeros((H, W, 3), np.uint8), 0.0).reason
+    est.detector.detect = lambda image: cube_detections(CUBE, T_base_table, (5, 5))
+    assert not est.estimate(np.zeros((H, W, 3), np.uint8), 0.0).valid

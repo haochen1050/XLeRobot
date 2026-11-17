@@ -16,7 +16,7 @@
 
 # ruff: noqa: N802, N803, N806  (T_a_b / K / R follow standard transform notation)
 
-"""Table pose from a single AprilTag (36h11) lying flat on the table.
+"""Table pose from a single AprilTag (36h11) on the table, or from a cube with a tag on each face.
 
 Tag frame (OpenCV ArUco convention): origin at the tag centre, x towards the printed right edge, y towards
 the printed top edge, z out of the printed face (up, for a tag lying on the table).
@@ -38,7 +38,10 @@ from .table_pose import TablePoseError, TablePoseEstimator, TableTarget, table_p
 FrameSource = Callable[[], tuple[np.ndarray, float] | None]
 
 
-TAG_MOUNTS = ("flat", "vertical")
+TAG_MOUNTS = ("flat", "vertical", "cube")
+CUBE_FACES = ("top", "front", "right", "back", "left")
+# Rotation about the vertical that takes the front face onto each side face (cube frame, see TagPlacement).
+_CUBE_SIDE_YAW_DEG = {"front": 0.0, "right": 90.0, "back": 180.0, "left": -90.0}
 
 # Reference orientation of each mount in the table frame (columns: tag x, y, z axes), before yaw_deg.
 _MOUNT_ROTATION = {
@@ -66,12 +69,41 @@ class TagPlacement:
     mount: str = "flat"
     # Tag centre height relative to the tabletop (negative = below the top surface). Vertical mount only.
     z_m: float = 0.0
+    # Cube mount only. The cube stands on the table; x_m / y_m are its centre and yaw_deg its rotation about the
+    # vertical (0 = the front face square to the robot). The cube frame, used in place of the tag frame, has its
+    # origin at the centre of the cube's base, x from the front face into the cube, y left, z up.
+    cube_size_m: float = 0.13
+    # (face, tag ID) for every face to use; tags with other IDs are ignored. Side tags have their printed top
+    # up; the top tag's printed top points to the right as seen from the front.
+    cube_faces: tuple[tuple[str, int], ...] = (("top", 5), ("front", 2), ("left", 3), ("right", 1), ("back", 0))
 
     def __post_init__(self) -> None:
         if self.mount not in TAG_MOUNTS:
             raise ValueError(f"mount must be one of {TAG_MOUNTS}, got {self.mount!r}")
+        if self.mount == "cube":
+            faces, ids = [f for f, _ in self.cube_faces], [i for _, i in self.cube_faces]
+            if not faces or set(faces) - set(CUBE_FACES) or len(set(faces)) < len(faces) or len(set(ids)) < len(ids):
+                raise ValueError(f"cube_faces needs distinct faces from {CUBE_FACES} with distinct IDs: {self.cube_faces}")
+            if self.size_m > self.cube_size_m:
+                raise ValueError(f"tag size {self.size_m} m is larger than the cube ({self.cube_size_m} m)")
+
+    def cube_face_poses(self) -> dict[int, np.ndarray]:
+        """{tag ID: pose of that face's tag in the cube frame}."""
+        s = self.cube_size_m
+        poses = {}
+        for face, tag_id in self.cube_faces:
+            if face == "top":
+                T = pose_xyz_yaw(0.0, 0.0, s, 180.0)
+            else:
+                T = pose_xyz_yaw(0.0, 0.0, 0.0, _CUBE_SIDE_YAW_DEG[face])
+                T[:3, :3] = T[:3, :3] @ _MOUNT_ROTATION["vertical"]
+                T[:3, 3] = T[:3, :3] @ np.array([0.0, 0.0, s / 2]) + np.array([0.0, 0.0, s / 2])
+            poses[tag_id] = T
+        return poses
 
     def T_table_tag(self) -> np.ndarray:
+        if self.mount == "cube":
+            return pose_xyz_yaw(self.x_m, self.y_m, 0.0, self.yaw_deg)
         z = self.z_m if self.mount == "vertical" else 0.0
         T = pose_xyz_yaw(self.x_m, self.y_m, z, 0.0)
         T[:3, :3] = _MOUNT_ROTATION[self.mount] @ pose_xyz_yaw(0, 0, 0, self.yaw_deg)[:3, :3]
@@ -143,6 +175,46 @@ class AprilTagDetector:
         return min(candidates, key=lambda o: o.reprojection_px)
 
 
+def solve_cube(
+    detector: AprilTagDetector,
+    matches: list[tuple[int, np.ndarray]],
+    face_poses: dict[int, np.ndarray],
+    up_in_cam: np.ndarray,
+) -> TagObservation:
+    """Cube pose in the camera frame from one or more of its face tags.
+
+    The largest face in the image gives a first pose (its planar ambiguity settled by which way is up); with
+    more faces, all their corners refine it together, which removes the single-tag wobble.
+    """
+    tag_id, corners = max(matches, key=lambda m: cv2.contourArea(m[1].astype(np.float32)))
+    T_cube_face = face_poses[tag_id]
+    first = detector.solve(tag_id, corners, up_in_cam=up_in_cam, up_in_tag=T_cube_face[2, :3])
+    T_cam_cube = first.T_cam_tag @ invert(T_cube_face)
+    if len(matches) == 1:
+        return TagObservation(tag_id, T_cam_cube, first.reprojection_px)
+
+    face_points = detector._object_points.astype(np.float64)
+    object_points = np.concatenate(
+        [(face_poses[i][:3, :3] @ face_points.T).T + face_poses[i][:3, 3] for i, _ in matches]
+    )
+    image_points = np.concatenate([c for _, c in matches]).astype(np.float64)
+    K, dist = detector.intrinsics.camera_matrix, detector.intrinsics.dist_coeffs
+    rvec, _ = cv2.Rodrigues(T_cam_cube[:3, :3])
+    _, rvec, tvec = cv2.solvePnP(
+        object_points,
+        image_points,
+        K,
+        dist,
+        rvec,
+        T_cam_cube[:3, 3].reshape(3, 1).copy(),
+        useExtrinsicGuess=True,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    projected, _ = cv2.projectPoints(object_points, rvec, tvec, K, dist)
+    rms = float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2) - image_points) ** 2, axis=1))))
+    return TagObservation(tag_id, from_rvec_tvec(rvec, tvec), rms)
+
+
 class AprilTagTableEstimator(TablePoseEstimator):
     def __init__(
         self,
@@ -188,13 +260,24 @@ class AprilTagTableEstimator(TablePoseEstimator):
         # Tag pose in the base frame from the most recent frame whose tag fitted; kept across frames so a
         # planned motion can be checked against it (see predict_tag_margin).
         self.last_fit_T_base_tag: np.ndarray | None = None
+        # Corners (tag frame; cube frame for a cube) whose predicted image positions decide whether a planned
+        # motion keeps the tag in view. For a cube: the faces of the last fit, the top face until then.
         self._tag_corners = tag_object_points(placement.size_m).astype(np.float64)
+        self._cube_faces = placement.cube_face_poses() if placement.mount == "cube" else None
+        if self._cube_faces is not None:
+            self._tag_corners = self._cube_corners([next(iter(self._cube_faces))])
 
     def get_table_pose_error(self) -> TablePoseError:
         frame = self.frame_source() if self.frame_source is not None else None
         if frame is None:
             return TablePoseError.invalid(self.clock(), "no camera frame")
         return self.estimate(*frame)
+
+    def _cube_corners(self, tag_ids: list[int]) -> np.ndarray:
+        face_points = tag_object_points(self.placement.size_m).astype(np.float64)
+        return np.concatenate(
+            [(self._cube_faces[i][:3, :3] @ face_points.T).T + self._cube_faces[i][:3, 3] for i in tag_ids]
+        )
 
     def _bearing_deg(self, corners: np.ndarray) -> float:
         """Bearing of the tag centre's viewing ray, projected onto the floor plane of the base frame."""
@@ -243,17 +326,27 @@ class AprilTagTableEstimator(TablePoseEstimator):
             )
 
         detections = self.detector.detect(image)
-        wanted = self.placement.tag_id
-        matches = [d for d in detections if wanted is None or d[0] == wanted]
-        if len(matches) == 1:
-            self.last_tag_bearing_deg = self._bearing_deg(matches[0][1])
-            self.last_tag_margin_px = self._margin_px(matches[0][1])
-        if len(matches) != 1:
-            seen = [d[0] for d in detections]
+        seen = [d[0] for d in detections]
+        if self._cube_faces is not None:
+            matches = [d for d in detections if d[0] in self._cube_faces]
+            # The same ID twice means a second cube or a false detection: which is which is unknown.
+            usable = bool(matches) and len({d[0] for d in matches}) == len(matches)
+            expected = f"cube tags {sorted(self._cube_faces)}"
+        else:
+            wanted = self.placement.tag_id
+            matches = [d for d in detections if wanted is None or d[0] == wanted]
+            usable = len(matches) == 1
             expected = "one tag" if wanted is None else f"tag {wanted}"
+        if not usable:
             return TablePoseError.invalid(capture_time_s, f"expected {expected}, saw {seen}")
+        pixels = np.concatenate([corners for _, corners in matches])
+        self.last_tag_bearing_deg = self._bearing_deg(pixels)
+        self.last_tag_margin_px = self._margin_px(pixels)
 
-        obs = self.detector.solve(*matches[0], up_in_cam=self._up_in_cam, up_in_tag=self._up_in_tag)
+        if self._cube_faces is not None:
+            obs = solve_cube(self.detector, matches, self._cube_faces, self._up_in_cam)
+        else:
+            obs = self.detector.solve(*matches[0], up_in_cam=self._up_in_cam, up_in_tag=self._up_in_tag)
         if obs.reprojection_px > self.max_reprojection_px:
             return TablePoseError.invalid(
                 capture_time_s, f"reprojection {obs.reprojection_px:.2f}px too high"
@@ -272,6 +365,8 @@ class AprilTagTableEstimator(TablePoseEstimator):
 
         self.last_raw_T_base_table = T_base_table
         self.last_fit_T_base_tag = T_base_tag
+        if self._cube_faces is not None:
+            self._tag_corners = self._cube_corners([d[0] for d in matches])
         heading = math.degrees(math.atan2(T_base_table[1, 0], T_base_table[0, 0]))
         if abs(heading) > self.max_heading_deg:
             quarter = 90 * round(heading / 90)

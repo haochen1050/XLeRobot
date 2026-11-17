@@ -10,7 +10,8 @@ requires-python = ">=3.10"
 dependencies = [
     "lerobot[feetech]",
     "numpy",
-    "opencv-python>=4.7",
+    # The headless build, as lerobot requires: opencv-python installs over the same cv2 folder.
+    "opencv-python-headless>=4.7",
     "pyrealsense2",
 ]
 

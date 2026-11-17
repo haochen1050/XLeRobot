@@ -48,6 +48,7 @@ import numpy as np
 from xlerobot_table_alignment.behaviors import AlignConfig, margin_scale
 from xlerobot_table_alignment.head import HeadHold, HeadMovedError, HeadPose, open_head_bus
 from xlerobot_table_alignment.perception import (
+    CUBE_FACES,
     TAG_MOUNTS,
     AprilTagDetector,
     AprilTagTableEstimator,
@@ -493,6 +494,9 @@ def collect_tag_poses(
 
 def require_head_pose(args) -> None:
     """Hold the head and verify it is at the saved pose: calibration and teaching are only valid there."""
+    if getattr(args, "no_head", False):
+        logger.info("--no-head: camera taken as fixed to the robot, head pose not checked")
+        return
     if not Path(args.head_pose).exists():
         raise SystemExit(f"No saved head pose at {args.head_pose}; run head_pose.py capture first")
     head = HeadHold(open_head_bus(args.head_port))
@@ -580,6 +584,8 @@ def table_tag_yaw(args) -> float:
         return args._resolved_tag_yaw
     if args.tag_mount == "vertical":
         yaw, source = 0.0, "vertical mount default: printed top up"
+    elif args.tag_mount == "cube":
+        yaw, source = 0.0, "cube default: front face square to the robot"
     else:
         try:
             yaw = float(json.loads(Path(args.extrinsics).read_text())["tag_pose_in_base"][3])
@@ -600,13 +606,36 @@ def make_estimator(args, cam: LatestFrame | None, target: TableTarget) -> AprilT
         tag_id=args.tag_id,
         mount=args.tag_mount,
         z_m=args.tag_height,
+        cube_size_m=args.cube_size,
+        cube_faces=args.cube_faces,
     )
     return AprilTagTableEstimator(
         CameraIntrinsics.load(args.intrinsics), load_transform(args.extrinsics), placement, target, cam
     )
 
 
+def parse_cube_faces(text: str) -> tuple[tuple[str, int], ...]:
+    """"top=5,front=2" -> (("top", 5), ("front", 2))."""
+    faces = []
+    for item in text.split(","):
+        face, _, tag_id = item.strip().partition("=")
+        if face not in CUBE_FACES or not tag_id.isdigit():
+            raise argparse.ArgumentTypeError(f"{item!r}: expected FACE=ID with FACE one of {', '.join(CUBE_FACES)}")
+        faces.append((face, int(tag_id)))
+    return tuple(faces)
+
+
 def tag_placement_args(args) -> dict:
+    if args.tag_mount == "cube":
+        return {
+            "edge_offset_m": args.tag_edge_offset,
+            "lateral_m": args.tag_lateral,
+            "yaw_deg": table_tag_yaw(args),
+            "size_m": args.tag_size,
+            "mount": "cube",
+            "cube_size_m": args.cube_size,
+            "cube_faces": [list(face) for face in args.cube_faces],
+        }
     return {
         "edge_offset_m": args.tag_edge_offset,
         "lateral_m": args.tag_lateral,
@@ -623,7 +652,7 @@ def target_placement_mismatch(args) -> str | None:
     path = Path(args.target)
     taught_with = json.loads(path.read_text()).get("tag_placement") if path.exists() else None
     now = tag_placement_args(args)
-    if taught_with is not None:
+    if taught_with is not None and taught_with.get("mount") != "cube":
         # Targets taught before mount support were flat tags.
         taught_with = {"mount": "flat", "height_m": 0.0, **taught_with}
     if taught_with is not None and taught_with != now:
@@ -745,6 +774,11 @@ def cmd_snapshot(args) -> None:
 def head_args(sp) -> None:
     sp.add_argument("--head-port", default=DEFAULTS["head_port"], help="Serial port of the bus with the head motors")
     sp.add_argument("--head-pose", default=str(DEFAULTS["head_pose"]))
+    sp.add_argument(
+        "--no-head",
+        action="store_true",
+        help="The camera is rigidly fixed to the robot (no head motors): skip the head pose hold and checks",
+    )
 
 
 def parse_size(text: str) -> tuple[int, int]:
@@ -797,13 +831,24 @@ def table_args(sp) -> None:
         "--tag-mount",
         choices=TAG_MOUNTS,
         default="flat",
-        help="flat: lying on the tabletop. vertical: hung on the front edge, facing the robot",
+        help="flat: lying on the tabletop. vertical: hung on the front edge, facing the robot. "
+        "cube: a cube standing on the table with a tag on each face (--cube-size, --cube-faces)",
+    )
+    sp.add_argument("--cube-size", type=float, default=0.13, help="Cube mount: outside edge of the cube (m)")
+    sp.add_argument(
+        "--cube-faces",
+        type=parse_cube_faces,
+        default=(("top", 5), ("front", 2), ("left", 3), ("right", 1), ("back", 0)),
+        help="Cube mount: FACE=ID for each face to use, faces named as seen from the robot at the table "
+        f"({', '.join(CUBE_FACES)}). Side tags have the printed top up; the top tag's printed top points right. "
+        "Other IDs are ignored (default: top=5,front=2,left=3,right=1,back=0)",
     )
     sp.add_argument(
         "--tag-edge-offset",
         type=float,
         required=True,
-        help="Tag centre distance from the front edge into the table (m); ~0 for a vertical tag on the edge",
+        help="Tag centre distance from the front edge into the table (m); ~0 for a vertical tag on the edge; "
+        "for a cube, the cube's centre",
     )
     sp.add_argument(
         "--tag-height",
@@ -874,7 +919,7 @@ def parse_args():
     sp.add_argument("--tag-z", type=float, default=0.0, help="Tag centre height above the floor (m)")
     sp.add_argument(
         "--tag-mount",
-        choices=TAG_MOUNTS,
+        choices=("flat", "vertical"),
         default="flat",
         help="flat: lying face up. vertical: standing upright, facing the robot",
     )

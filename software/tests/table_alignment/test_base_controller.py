@@ -216,10 +216,8 @@ def test_open_wheel_bus_rejects_wrong_device(monkeypatch, answering, power_hint,
 
     disconnected = []
 
-    from lerobot.motors.feetech import FeetechMotorsBus
-
     class FakeFeetech:
-        model_number_table = FeetechMotorsBus.model_number_table
+        model_number_table = {"sts3215": 777}
 
         def __init__(self, port, motors):
             self.motors = motors

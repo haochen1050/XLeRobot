@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .base import BaseInterlockError
+from .base import BaseInterlockError, motor_model_number
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +62,18 @@ def open_head_bus(port: str) -> Any:
         name: Motor(id=id_, model=HEAD_MOTOR_MODEL, norm_mode=MotorNormMode.RANGE_M100_100)
         for name, id_ in HEAD_IDS.items()
     }
+    # The bus only talks to IDs it was built with, so the wheel-only ID is registered to be pinged. It is
+    # never written: every write and torque call below names the head motors.
+    probe = "wheel_bus_probe"
+    motors[probe] = Motor(id=WHEEL_BUS_ONLY_ID, model=HEAD_MOTOR_MODEL, norm_mode=MotorNormMode.RANGE_M100_100)
     bus = FeetechMotorsBus(port=port, motors=motors)
     bus.connect(handshake=False)
     try:
-        expected = bus.model_number_table[HEAD_MOTOR_MODEL]
-        found = {name: bus.ping(name, num_retry=2) for name in motors}
+        expected = motor_model_number(bus, HEAD_MOTOR_MODEL)
+        found = {name: bus.ping(name, num_retry=2) for name in HEAD_IDS}
         if any(model != expected for model in found.values()):
             raise HeadBusMismatchError(f"{port} is not the head bus: expected {expected} on {HEAD_IDS}, got {found}")
-        if bus.ping(WHEEL_BUS_ONLY_ID, num_retry=2) is not None:
+        if bus.ping(probe, num_retry=2) is not None:
             raise HeadBusMismatchError(
                 f"{port} is the wheel bus (ID {WHEEL_BUS_ONLY_ID} answers), not the head bus; try the other port"
             )

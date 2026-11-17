@@ -541,9 +541,28 @@ class AlignToTable:
         while True:
             status, bearing = self._look()
             if status == "valid":
-                self._event("search_done", rotated_deg=rotated, bearing_deg=bearing)
-                return
-            if status == "seen":
+                # Usable, but if the tag sits at the side of the image the first pulse would be cut short by the
+                # in-view watch: turn to face it first. Only when the turn is predicted to bring the tag further
+                # inside: a tag near the top or bottom edge can get closer to that edge when faced, and is then lost.
+                margin = getattr(self.estimator, "last_tag_margin_px", None)
+                angle = 0.0
+                if (
+                    self._keeps_view()
+                    and margin is not None
+                    and bearing is not None
+                    and margin < cfg.view_margin_px * self._margin_scale
+                    and abs(bearing) > cfg.search_center_deg
+                ):
+                    angle = max(-cfg.search_step_deg, min(cfg.search_step_deg, bearing))
+                    predicted = self.estimator.predict_tag_margin(0.0, 0.0, angle)
+                    if predicted is None or predicted <= margin:
+                        angle = 0.0
+                if angle == 0.0:
+                    self._event(
+                        "search_done", rotated_deg=rotated, bearing_deg=bearing, tag_edge_margin_px=margin
+                    )
+                    return
+            elif status == "seen":
                 if abs(bearing) <= cfg.search_center_deg:
                     if self._raw_seen and cfg.orbit:
                         # Facing the tag, which fitted fine, yet the table heading is beyond the limit: the
@@ -742,6 +761,11 @@ class AlignToTable:
                 self._scale["orbit"] *= 0.5
                 continue
             if abs(new_err) > abs(angle_err) - 0.3 * abs(orbit):
+                if elapsed < 0.5 * duration:
+                    raise _FaultError(
+                        f"orbit pulse cut short after {elapsed:.2f} s because the tag is at the image edge; "
+                        "start with the tag nearer the image centre"
+                    )
                 raise _FaultError(
                     f"orbit did not reduce the angle ({angle_err:+.1f} -> {new_err:+.1f} deg after a "
                     f"{orbit:+.1f} deg step): slipping, or the tag moved"

@@ -16,6 +16,9 @@ GOAL = {"head_motor_1": 2000, "head_motor_2": 1500}
 WHEELS = ("base_left_wheel", "base_back_wheel", "base_right_wheel")
 
 
+logs_missing = "/nonexistent/head_pose.json"
+
+
 class FakeBus:
     """Head and wheels both: reads the head position, remembers writes."""
 
@@ -26,12 +29,12 @@ class FakeBus:
         self.torque = False
         self.disconnects = []
 
-    def read(self, data, name, normalize=True):
+    def read(self, data, name, normalize=True, num_retry=0):
         if data == "Present_Position":
             return self.present[name] + self.drift
         return 0 if data == "Operating_Mode" else self.goal[name]
 
-    def write(self, data, name, value, normalize=True):
+    def write(self, data, name, value, normalize=True, num_retry=0):
         if data == "Goal_Velocity":
             self.goal[name] = value
 
@@ -114,6 +117,14 @@ def test_ready_run_holds_the_head_and_writes_a_log(run):
     assert start["config"]["heading"]["min_speed"] == 5.0
 
 
+def test_no_head_runs_without_opening_the_head_bus(run, monkeypatch):
+    head = FakeBus(drift=50)  # would refuse to start if it were consulted
+    code, wheels, logs = run(head, "--no-head", f"--head-pose={logs_missing}")
+    assert code == 0
+    assert not head.torque and not head.disconnects
+    assert wheels.disconnects == [True]
+
+
 def test_dry_run_never_touches_the_torque_or_the_wheels(run, monkeypatch):
     head = FakeBus()
     code, wheels, logs = run(head, "--dry-run")
@@ -142,3 +153,40 @@ def test_head_moving_after_the_last_pulse_is_not_ready(run, monkeypatch):
     code, _, logs = run(head)
     assert code == 1
     assert '"fault"' in logs[0].read_text()
+
+
+class FaultThenReady:
+    """Controller stand-in: faults on the first runs, then reports ready."""
+
+    outcomes: list = []
+
+    def __init__(self, base, estimator, config, log=None):
+        self.base = base
+
+    def run(self):
+        from xlerobot_table_alignment.behaviors import AlignResult
+
+        state, reason = self.outcomes.pop(0)
+        summary = {"search_rotation_deg": 0.0, "radial_m": 0.0, "orbit_deg": 0.0, "recoveries": 0}
+        return AlignResult(state, reason=reason, events=[summary])
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "retries", "code", "runs"),
+    [
+        ([("FAULT", "lateral error grew"), ("BASE_READY", "")], 2, 0, 2),  # second attempt succeeds
+        ([("FAULT", "x"), ("FAULT", "x"), ("FAULT", "x")], 1, 1, 2),  # gives up after the allowed retries
+        ([("FAULT", "x"), ("BASE_READY", "")], 0, 1, 1),  # no retries unless asked
+        ([("FAULT", "final stop not confirmed: {}"), ("BASE_READY", "")], 2, 1, 1),  # never after a failed stop
+    ],
+)
+def test_retries_only_after_a_fault_with_the_base_stopped(run, monkeypatch, outcomes, retries, code, runs):
+    from xlerobot_table_alignment.behaviors import AlignState
+
+    FaultThenReady.outcomes = [(AlignState[state], reason) for state, reason in outcomes]
+    monkeypatch.setattr(script, "AlignToTable", FaultThenReady)
+    monkeypatch.setattr(script, "RETRY_PAUSE_S", 0.0)
+    got, _wheels, logs = run(FakeBus(), "--no-head", f"--retries={retries}")
+    assert got == code
+    assert len(logs) == runs
+    assert len(FaultThenReady.outcomes) == len(outcomes) - runs

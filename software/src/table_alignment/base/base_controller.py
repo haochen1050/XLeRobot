@@ -43,6 +43,8 @@ WHEEL_MOTOR_MODEL = "sts3215"
 WHEEL_RADIUS_M = 0.05
 BASE_RADIUS_M = 0.125
 WHEEL_NAMES: tuple[str, str, str] = ("base_left_wheel", "base_back_wheel", "base_right_wheel")
+# Extra attempts per bus call: a single corrupted packet (checksum error) must not abort a run.
+BUS_RETRIES = 2
 
 _DEFERRED_SIGNALS = tuple(
     sig for sig in (getattr(signal, n, None) for n in ("SIGINT", "SIGTERM", "SIGHUP")) if sig is not None
@@ -172,7 +174,7 @@ class BaseController:
 
         try:
             for name, value in wheel_cmds.items():
-                self.bus.write("Goal_Velocity", name, value, normalize=False)
+                self.bus.write("Goal_Velocity", name, value, normalize=False, num_retry=BUS_RETRIES)
         except Exception:
             logger.exception("Wheel velocity write failed; stopping base")
             self.stop_base()
@@ -194,14 +196,14 @@ class BaseController:
                 attempt += 1
                 for name in pending:
                     try:
-                        self.bus.write("Goal_Velocity", name, 0, normalize=False)
+                        self.bus.write("Goal_Velocity", name, 0, normalize=False, num_retry=BUS_RETRIES)
                     except Exception as e:
                         errors[name] = f"write: {e!r}"
                         logger.error("Stop attempt %d: zero write to %s failed: %r", attempt, name, e)
 
                 for name in pending:
                     try:
-                        readback[name] = int(self.bus.read("Goal_Velocity", name, normalize=False))
+                        readback[name] = int(self.bus.read("Goal_Velocity", name, normalize=False, num_retry=BUS_RETRIES))
                     except Exception as e:
                         readback[name] = None
                         errors[name] = f"read: {e!r}"
@@ -276,6 +278,20 @@ class BaseController:
             raise BaseStopError(f"Base stop not confirmed on exit: {result.errors}")
 
 
+def motor_model_number(bus: Any, model: str) -> int:
+    """The model number a motor of ``model`` answers a ping with.
+
+    Older lerobot keeps a table on the bus class; the rustypot-backed bus (lerobot >= 0.7) has none, and
+    rustypot knows the number.
+    """
+    table = getattr(bus, "model_number_table", None)
+    if table is not None:
+        return table[model]
+    import rustypot
+
+    return rustypot.find_model(model)[0]
+
+
 def open_wheel_bus(
     port: str,
     motor_model: str = WHEEL_MOTOR_MODEL,
@@ -300,8 +316,7 @@ def open_wheel_bus(
     bus = FeetechMotorsBus(port=port, motors=motors)
     bus.connect(handshake=False)
     try:
-        # From the bus class: the module holding this table moved between lerobot versions.
-        expected = bus.model_number_table[motor_model]
+        expected = motor_model_number(bus, motor_model)
         found = {name: bus.ping(name, num_retry=2) for name in motors}
         bad = {name: model for name, model in found.items() if model != expected}
         if bad:
@@ -317,14 +332,14 @@ def open_wheel_bus(
 
         for name in motors:
             try:
-                bus.write("Lock", name, 0, normalize=False)
+                bus.write("Lock", name, 0, normalize=False, num_retry=BUS_RETRIES)
             except Exception as e:
                 logger.warning("Unlock of %s failed (continuing): %r", name, e)
-            bus.disable_torque(name)
-            bus.write("Operating_Mode", name, OperatingMode.VELOCITY.value, normalize=False)
+            bus.disable_torque(name, num_retry=BUS_RETRIES)
+            bus.write("Operating_Mode", name, OperatingMode.VELOCITY.value, normalize=False, num_retry=BUS_RETRIES)
             # Clear any stale goal before torque comes back on.
-            bus.write("Goal_Velocity", name, 0, normalize=False)
-            bus.enable_torque(name)
+            bus.write("Goal_Velocity", name, 0, normalize=False, num_retry=BUS_RETRIES)
+            bus.enable_torque(name, num_retry=BUS_RETRIES)
     except BaseException:
         bus.disconnect(disable_torque=False)
         raise

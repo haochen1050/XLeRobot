@@ -506,6 +506,26 @@ def facing_tag(x, y, **kwargs):
     return ViewWorld(x=x, y=y, yaw_deg=math.degrees(math.atan2(-y, -x)), **kwargs)
 
 
+def test_search_faces_a_usable_tag_found_at_the_image_edge():
+    # In front of the table but turned 28 deg: the tag is usable, yet only 2 deg (20 px) inside the +-30 deg view.
+    # Without facing it first, the in-view watch cuts the first pulse short and the run faults.
+    world = ViewWorld(x=-0.36, y=0.0, yaw_deg=28.0, fov_deg=30.0)
+    result = run(world)
+
+    assert result.ready, result.reason
+    turns = [e for e in result.events if e["event"] == "search_pulse"]
+    assert turns and all(e["status"] == "valid" and e["omega_degps"] < 0 for e in turns)
+    assert world.min_true_margin > 0
+
+
+def test_search_does_not_turn_when_facing_the_tag_would_not_bring_it_further_into_view():
+    # Tag near the top edge of the image: facing it does not help (here: the predicted margin never improves).
+    world = ViewWorld(x=-0.36, y=0.0, yaw_deg=28.0, fov_deg=30.0)
+    world.predict_tag_margin = lambda dx, dy, dyaw: world.last_tag_margin_px
+    result = run(world, max_steps=1)
+    assert not [e for e in result.events if e["event"] == "search_pulse"]
+
+
 def test_tag_stays_in_view_when_aligning_heading_would_lose_it():
     # 15 cm to the side and looking at the tag: turning square to the table first would put the tag ~23 deg
     # off-centre, outside the +-20 deg view. The plan must keep it in view the whole time.

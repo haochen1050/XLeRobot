@@ -1,7 +1,7 @@
 # Table alignment on XLeRobot: how it works
 
 This explains what the table alignment does, how the parts fit together, and what is and isn't verified yet. For the
-bring-up steps and commands, see [README.md](README.md).
+bring-up steps and commands, see [README.md](software/examples/table_alignment/README.md).
 
 ## What it does
 
@@ -49,6 +49,10 @@ head camera ──► AprilTag detect + PnP ──► camera→base (extrinsics)
     torque on.
   - During alignment, every pulse first checks the head is still within 6 ticks (about 0.5°) of the saved pose. If
     it isn't, the run faults, because the camera calibration only holds at that pose.
+
+- **No head** (`--no-head`)
+  - For a camera fixed rigidly to the robot, with no head motors. The head bus is never opened and nothing checks
+    that the camera has stayed put.
 
 ### Controller stages
 
@@ -110,6 +114,12 @@ The run faults, and the base stops, when:
   - `vertical`: standing upright facing the robot, default yaw 0°, with its printed top up. `--tag-height` is
     the tag centre's height above the tabletop.
 
+  - `cube`: a cube standing on the table with a tag on each face (`--cube-size`, default 0.13 m). `--cube-faces`
+    lists the faces to use as `FACE=ID` (default `top=5,front=2,left=3,right=1,back=0`); tags with other IDs are ignored. Side tags have
+    the printed top up, and the top tag's printed top points right as seen from the front. Any one listed face
+    gives the pose; with two or more, all their corners are fitted together. `--tag-edge-offset` is then the
+    cube centre's distance from the front edge, and yaw 0 means the front face is square to the robot.
+
   Use the same tag options for `watch`, `teach` and `align_to_table.py`. If they differ, you get a warning and the
   errors are offset.
 
@@ -156,9 +166,13 @@ Files written under `outputs/table_alignment/` in the folder you run from (`soft
   - The intrinsics only hold at the size they were made at. Later steps take that size from the intrinsics file.
 - **lerobot version:**
   - The DGX venv has a newer lerobot, which uses the `rustypot` bus backend.
-  - `lerobot.motors.feetech.tables` no longer exists there; the code now reads `bus.model_number_table` instead.
-  - The other calls used are `ping`, `read`/`write` with `normalize=False`, `enable_torque`/`disable_torque`, and
-    `connect(handshake=False)`. None of them have been tried against that version yet.
+  - Neither `lerobot.motors.feetech.tables` nor `bus.model_number_table` exists there (lerobot 0.7.0);
+    `motor_model_number()` in `base_controller.py` asks rustypot when the bus has no table.
+  - Tried on the DGX against the wheel bus: `connect(handshake=False)`, `ping`, and `read` with
+    `normalize=False`. `write` and the torque calls ran once and hit a checksum error on one wheel, so every
+    wheel bus call now retries twice (`BUS_RETRIES`).
+  - Two simulated perception tests fail with the venv's OpenCV 4.13 (they pass on 5.0): the tag detector's
+    corners are about 1 px off on some rendered 640x480 views, with either version.
   - If one fails, the fix belongs in `base_controller.py` or `head.py`. Nothing else talks to the motors.
 - **Before running:** stop teleoperation and anything else holding the ports or the camera, and stow the arms.
 

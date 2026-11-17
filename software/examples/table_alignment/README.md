@@ -3,7 +3,7 @@
 Drives the base to a taught pose in front of a table using an AprilTag and the head RealSense, in short pulses that
 each end in a verified stop. Ported from AlohaMini. The code is in `software/src/table_alignment`.
 
-How it works, the code layout, host-PC notes and troubleshooting: [OVERVIEW.md](OVERVIEW.md).
+How it works, the code layout, host-PC notes and troubleshooting: [OVERVIEW.md](../../../OVERVIEW.md).
 
 **Not yet run on an XLeRobot.** The steps below are also the bring-up: do them in order, and don't skip the sign check.
 
@@ -48,6 +48,9 @@ python table_perception.py snapshot   # saves outputs/table_alignment/snapshot.p
 python head_pose.py capture
 ```
 
+**Fixed camera, no head motors:** skip `head_pose.py` and add `--no-head` to `calibrate-extrinsics`, `teach` and
+`align_to_table.py`. Nothing then checks that the camera has not moved, so redo steps 3 and 5 if it is bumped.
+
 The head now holds this pose, and it stays held after the script exits. Everything after this is valid only at this
 pose. If you capture again, redo steps 3 and 5. `head_pose.py goto` slowly returns to it after a power cycle, and
 `head_pose.py check` shows how far off it is.
@@ -86,6 +89,10 @@ python table_perception.py watch --tag-edge-offset 0.3 --tag-yaw-deg -90
 `--tag-edge-offset` is the tag centre's distance in from the table's front edge. Move the robot by hand: distance,
 lateral and heading errors must change in the expected direction.
 
+With a tag cube instead of a single tag (13 cm cube, 10 cm tags; tag 5 on top, 2 facing the robot, 3 left, 1 right, 0 back), use
+`--tag-mount cube` in `watch`, `teach` and `align_to_table.py`; `--tag-edge-offset` is then the cube centre's
+distance from the front edge. `--cube-faces` changes which tag is on which face.
+
 ## 5. Teach the target
 
 Park the robot by hand exactly where it should end up, then:
@@ -109,6 +116,10 @@ python align_to_table.py --tag-edge-offset 0.3 --tag-yaw-deg -90 --axes heading,
 For a round table, add `--table-radius 0.3`. Measure the robot before orbiting: the keep-out radius defaults to table
 radius + 0.40 m, which assumes nothing reaches further than 0.30 m from the base centre. That is the bare cart, so if
 the arms stick out further, set `--keepout-radius`.
+
+`--retries N` starts again, up to N times, after a fault that left the base stopped. It never retries after Ctrl-C,
+an unconfirmed stop or a moved head. Each attempt writes its own log. A run that often needs retries has a cause
+worth finding: check the fault reasons with `align_report.py`.
 
 `align_report.py` tabulates the trial logs.
 
