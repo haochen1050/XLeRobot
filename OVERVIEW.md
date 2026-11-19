@@ -114,11 +114,16 @@ The run faults, and the base stops, when:
   - `vertical`: standing upright facing the robot, default yaw 0°, with its printed top up. `--tag-height` is
     the tag centre's height above the tabletop.
 
-  - `cube`: a cube standing on the table with a tag on each face (`--cube-size`, default 0.13 m). `--cube-faces`
-    lists the faces to use as `FACE=ID` (default `top=5,front=2,left=3,right=1,back=0`); tags with other IDs are ignored. Side tags have
-    the printed top up, and the top tag's printed top points right as seen from the front. Any one listed face
-    gives the pose; with two or more, all their corners are fitted together. `--tag-edge-offset` is then the
-    cube centre's distance from the front edge, and yaw 0 means the front face is square to the robot.
+  - `cube`: a cube on the table, or on a holder, with a tag on each face (`--cube-size`, default 0.13 m). Its
+    height above the table doesn't matter.
+    - `--cube-faces` lists the faces to use as `FACE=ID` or `FACE=ID@TURN`; tags with other IDs are ignored.
+    - With no turn, side tags have the printed top up, and the top tag's printed top points right as seen from
+      the front. `@TURN` (90, 180 or 270) turns the tag counter-clockwise from there, seen from outside the cube.
+    - The default is the lab's cube: `top=5,front=2,left=3,right=1,back=0`, each face checked on the camera
+      (tag 4 is on the bottom). If the cube is put on another way, give its layout with `@TURN` where needed.
+    - Any one listed face gives the pose; with two or more, all their corners are fitted together.
+    - `--tag-edge-offset` is then the cube centre's distance from the front edge, and yaw 0 means the front
+      face is square to the robot.
 
   Use the same tag options for `watch`, `teach` and `align_to_table.py`. If they differ, you get a warning and the
   errors are offset.

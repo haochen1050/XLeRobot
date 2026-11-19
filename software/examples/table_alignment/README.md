@@ -89,9 +89,15 @@ python table_perception.py watch --tag-edge-offset 0.3 --tag-yaw-deg -90
 `--tag-edge-offset` is the tag centre's distance in from the table's front edge. Move the robot by hand: distance,
 lateral and heading errors must change in the expected direction.
 
-With a tag cube instead of a single tag (13 cm cube, 10 cm tags; tag 5 on top, 2 facing the robot, 3 left, 1 right, 0 back), use
-`--tag-mount cube` in `watch`, `teach` and `align_to_table.py`; `--tag-edge-offset` is then the cube centre's
-distance from the front edge. `--cube-faces` changes which tag is on which face.
+With a tag cube instead of a single tag (13 cm cube, 10 cm tags), use `--tag-mount cube` in `watch`, `teach` and
+`align_to_table.py`; `--tag-edge-offset` is then the cube centre's distance from the front edge. The cube can
+stand on the table or on a holder: its height doesn't matter.
+
+`--cube-faces` says which tag is on which face and how it is turned. The default is the lab's cube:
+`top=5,front=2,left=3,right=1,back=0` (tag 4 on the bottom). `@TURN` is how far the tag is turned counter-clockwise, seen
+from outside the cube, from printed top up (for the top tag, from printed top pointing right as seen from the
+front). To check a layout, face the cube, run `watch`, and turn the cube a quarter turn at a time: the readings
+should stay the same apart from the heading.
 
 ## 5. Teach the target
 

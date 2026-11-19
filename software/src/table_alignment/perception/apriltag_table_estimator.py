@@ -69,21 +69,27 @@ class TagPlacement:
     mount: str = "flat"
     # Tag centre height relative to the tabletop (negative = below the top surface). Vertical mount only.
     z_m: float = 0.0
-    # Cube mount only. The cube stands on the table; x_m / y_m are its centre and yaw_deg its rotation about the
-    # vertical (0 = the front face square to the robot). The cube frame, used in place of the tag frame, has its
-    # origin at the centre of the cube's base, x from the front face into the cube, y left, z up.
+    # Cube mount only. The cube stands on the table, or on a holder (its height does not matter); x_m / y_m are
+    # its centre and yaw_deg its rotation about the vertical (0 = the front face square to the robot). The cube
+    # frame, used in place of the tag frame, has its origin at the centre of the cube's base, x from the front
+    # face into the cube, y left, z up.
     cube_size_m: float = 0.13
-    # (face, tag ID) for every face to use; tags with other IDs are ignored. Side tags have their printed top
-    # up; the top tag's printed top points to the right as seen from the front.
-    cube_faces: tuple[tuple[str, int], ...] = (("top", 5), ("front", 2), ("left", 3), ("right", 1), ("back", 0))
+    # (face, tag ID) or (face, tag ID, turn_deg) for every face to use; tags with other IDs are ignored. With no
+    # turn, side tags have their printed top up and the top tag's printed top points to the right as seen from
+    # the front. turn_deg (a multiple of 90) turns the tag from there about the face's outward normal,
+    # counter-clockwise as seen from outside the cube: 90 = a side tag's printed top points to the viewer's left.
+    # The default is the lab's cube, each face checked on the camera (tag 4 is on the bottom).
+    cube_faces: tuple[tuple, ...] = (("top", 5), ("front", 2), ("left", 3), ("right", 1), ("back", 0))
 
     def __post_init__(self) -> None:
         if self.mount not in TAG_MOUNTS:
             raise ValueError(f"mount must be one of {TAG_MOUNTS}, got {self.mount!r}")
         if self.mount == "cube":
-            faces, ids = [f for f, _ in self.cube_faces], [i for _, i in self.cube_faces]
+            faces, ids = [f[0] for f in self.cube_faces], [f[1] for f in self.cube_faces]
             if not faces or set(faces) - set(CUBE_FACES) or len(set(faces)) < len(faces) or len(set(ids)) < len(ids):
                 raise ValueError(f"cube_faces needs distinct faces from {CUBE_FACES} with distinct IDs: {self.cube_faces}")
+            if any(len(f) > 3 or (len(f) == 3 and f[2] % 90 != 0) for f in self.cube_faces):
+                raise ValueError(f"a cube face's turn must be a multiple of 90 deg: {self.cube_faces}")
             if self.size_m > self.cube_size_m:
                 raise ValueError(f"tag size {self.size_m} m is larger than the cube ({self.cube_size_m} m)")
 
@@ -91,13 +97,15 @@ class TagPlacement:
         """{tag ID: pose of that face's tag in the cube frame}."""
         s = self.cube_size_m
         poses = {}
-        for face, tag_id in self.cube_faces:
+        for face, tag_id, *turn in self.cube_faces:
             if face == "top":
                 T = pose_xyz_yaw(0.0, 0.0, s, 180.0)
             else:
                 T = pose_xyz_yaw(0.0, 0.0, 0.0, _CUBE_SIDE_YAW_DEG[face])
                 T[:3, :3] = T[:3, :3] @ _MOUNT_ROTATION["vertical"]
                 T[:3, 3] = T[:3, :3] @ np.array([0.0, 0.0, s / 2]) + np.array([0.0, 0.0, s / 2])
+            if turn:
+                T[:3, :3] = T[:3, :3] @ pose_xyz_yaw(0.0, 0.0, 0.0, turn[0])[:3, :3]
             poses[tag_id] = T
         return poses
 

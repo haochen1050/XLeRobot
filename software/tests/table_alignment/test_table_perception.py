@@ -474,6 +474,32 @@ def test_cube_face_layout_matches_the_measured_cube():
         np.testing.assert_allclose(faces[tag_id][:3, 3], np.array(outward) * 0.065 + [0, 0, 0.065], atol=1e-9)
 
 
+def test_cube_face_turn_rotates_the_tag_about_its_outward_normal():
+    plain = TagPlacement(x_m=0.25, mount="cube", cube_faces=(("front", 1), ("top", 2))).cube_face_poses()
+    turned = TagPlacement(x_m=0.25, mount="cube", cube_faces=(("front", 1, 270), ("top", 2, 90))).cube_face_poses()
+    for tag_id in (1, 2):
+        np.testing.assert_allclose(turned[tag_id][:3, 3], plain[tag_id][:3, 3], atol=1e-9)
+        np.testing.assert_allclose(turned[tag_id][:3, 2], plain[tag_id][:3, 2], atol=1e-9)
+    # Front tag turned 270 deg counter-clockwise: its printed top points to the viewer's right (cube -y).
+    np.testing.assert_allclose(turned[1][:3, 1], [0, -1, 0], atol=1e-9)
+    # Top tag turned 90 deg counter-clockwise from "printed top to the right": printed top points away (cube +x).
+    np.testing.assert_allclose(turned[2][:3, 1], [1, 0, 0], atol=1e-9)
+    with pytest.raises(ValueError, match="multiple of 90"):
+        TagPlacement(x_m=0.25, mount="cube", cube_faces=(("front", 1, 45),))
+
+
+def test_a_turned_cube_layout_gives_the_same_faces_as_the_cube_rolled_over():
+    # The default cube laid on its back face and turned so tag 2 is on top and tag 1 faces the robot: the
+    # layout that was measured that way on the camera.
+    default = TagPlacement(x_m=0.25, mount="cube").cube_face_poses()
+    rolled = TagPlacement(
+        x_m=0.25, mount="cube", cube_faces=(("top", 2), ("front", 1, 270), ("right", 5, 90), ("back", 3, 90))
+    ).cube_face_poses()
+    R = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [-1.0, 0.0, 0.0]])
+    for tag_id, T in rolled.items():
+        np.testing.assert_allclose(T[:3, :3], R @ default[tag_id][:3, :3], atol=1e-9)
+
+
 @pytest.mark.parametrize("ids", [(5,), (2,), (5, 2), (5, 2, 1), (5, 3)])
 @pytest.mark.parametrize(("x", "y", "yaw_deg"), [(0.70, 0.0, 0.0), (0.75, 0.10, 12.0), (0.85, -0.12, -20.0)])
 def test_cube_gives_the_same_table_pose_from_any_of_its_faces(ids, x, y, yaw_deg):

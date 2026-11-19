@@ -614,14 +614,22 @@ def make_estimator(args, cam: LatestFrame | None, target: TableTarget) -> AprilT
     )
 
 
-def parse_cube_faces(text: str) -> tuple[tuple[str, int], ...]:
-    """"top=5,front=2" -> (("top", 5), ("front", 2))."""
+# The lab's cube, each face checked on the camera. Tag 4 is on the bottom.
+DEFAULT_CUBE_FACES = "top=5,front=2,left=3,right=1,back=0"
+
+
+def parse_cube_faces(text: str) -> tuple[tuple[str, int, int], ...]:
+    """"top=5,front=2@270" -> (("top", 5, 0), ("front", 2, 270))."""
     faces = []
     for item in text.split(","):
-        face, _, tag_id = item.strip().partition("=")
-        if face not in CUBE_FACES or not tag_id.isdigit():
-            raise argparse.ArgumentTypeError(f"{item!r}: expected FACE=ID with FACE one of {', '.join(CUBE_FACES)}")
-        faces.append((face, int(tag_id)))
+        face, _, tag = item.strip().partition("=")
+        tag_id, _, turn = tag.partition("@")
+        if face not in CUBE_FACES or not tag_id.isdigit() or not (turn or "0").isdigit() or int(turn or 0) % 90:
+            raise argparse.ArgumentTypeError(
+                f"{item!r}: expected FACE=ID or FACE=ID@TURN with FACE one of {', '.join(CUBE_FACES)} "
+                "and TURN a multiple of 90"
+            )
+        faces.append((face, int(tag_id), int(turn or 0) % 360))
     return tuple(faces)
 
 
@@ -832,16 +840,18 @@ def table_args(sp) -> None:
         choices=TAG_MOUNTS,
         default="flat",
         help="flat: lying on the tabletop. vertical: hung on the front edge, facing the robot. "
-        "cube: a cube standing on the table with a tag on each face (--cube-size, --cube-faces)",
+        "cube: a cube on the table, or on a holder, with a tag on each face (--cube-size, --cube-faces)",
     )
     sp.add_argument("--cube-size", type=float, default=0.13, help="Cube mount: outside edge of the cube (m)")
     sp.add_argument(
         "--cube-faces",
         type=parse_cube_faces,
-        default=(("top", 5), ("front", 2), ("left", 3), ("right", 1), ("back", 0)),
+        default=parse_cube_faces(DEFAULT_CUBE_FACES),
         help="Cube mount: FACE=ID for each face to use, faces named as seen from the robot at the table "
         f"({', '.join(CUBE_FACES)}). Side tags have the printed top up; the top tag's printed top points right. "
-        "Other IDs are ignored (default: top=5,front=2,left=3,right=1,back=0)",
+        "FACE=ID@TURN turns a tag from there by TURN deg (90, 180 or 270) counter-clockwise as seen from "
+        "outside the cube: front=1@270 is a front tag whose printed top points right. "
+        f"Other IDs are ignored (default: {DEFAULT_CUBE_FACES})",
     )
     sp.add_argument(
         "--tag-edge-offset",
